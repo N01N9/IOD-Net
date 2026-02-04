@@ -52,7 +52,11 @@ def merge_intervals(intervals, gap_threshold=0.5):
     return merged
 
 def inference(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 사용자가 지정하거나, 없으면 자동 선택
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running inference on: {device}")
 
     # 1. 모델 로드
@@ -173,6 +177,7 @@ if __name__ == "__main__":
     parser.add_argument("--d_model", type=int, default=128, help="Model hidden dimension")
     parser.add_argument("--max_speakers", type=int, default=6, help="Max speakers")
     parser.add_argument("--threshold", type=float, default=0.5, help="Voice activity threshold")
+    parser.add_argument("--device", type=str, default=None, help="Device to use (e.g., cpu, cuda)")
     
     args = parser.parse_args()
     inference(args)
