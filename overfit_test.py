@@ -6,7 +6,7 @@ import os
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from model import IterativeDiarizer, SortedBCELoss
+from model import IterativeDiarizer, HungarianPITLoss
 from train import LogMelSpectrogram, get_args  # Reuse components from train.py
 from dataset import get_dataloader
 
@@ -15,7 +15,7 @@ def run_overfit_test():
     args = get_args()
     
     # Force settings for overfitting test
-    args.batch_size = 2  # Larger batch to test full memory load and throughput
+    args.batch_size = 4  # Larger batch to test full memory load and throughput
     args.epochs = 1000    # Ensure convergence
     
     print(">>> Starting Overfitting Test")
@@ -55,7 +55,7 @@ def run_overfit_test():
         max_speakers=args.max_speakers
     ).to(device)
     
-    loss_fn = SortedBCELoss().to(device)
+    loss_fn = HungarianPITLoss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001) # Slightly higher LR for quick convergence
 
     # Pre-calculate features once to purely test the Model/Decoder capacity (Optional, but faster)

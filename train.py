@@ -5,39 +5,35 @@ import torchaudio
 import argparse
 import os
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
-from model import IterativeDiarizer, SortedBCELoss
+# model.py에서 최신 변경된 클래스들 임포트
+from model import IterativeDiarizer, HungarianPITLoss
 from dataset import get_dataloader
 
 # ==========================================
 # Configuration
 # ==========================================
-# User should replace this with their actual Hugging Face Dataset Repo ID
-# Example: "organization/my-speech-dataset"
 DEFAULT_REPO_ID = "N02N9/ncgm-voxceleb" 
 
 def get_args():
     parser = argparse.ArgumentParser(description="Train IOD-Net")
     parser.add_argument("--repo_id", type=str, default=DEFAULT_REPO_ID, 
-                        help="Hugging Face Dataset Repo ID (required)")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
+                        help="Hugging Face Dataset Repo ID")
+    parser.add_argument("--batch_size", type=int, default=8, help="Physical Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
-    parser.add_argument("--feat_dim", type=int, default=128, help="Feature dimension (Mel bins)")
+    parser.add_argument("--feat_dim", type=int, default=128, help="Feature dimension")
     parser.add_argument("--d_model", type=int, default=128, help="Model hidden dimension")
-    parser.add_argument("--max_speakers", type=int, default=6, help="Max speakers to separate")
-    parser.add_argument("--duration", type=float, default=20.0, help="Audio duration in seconds")
+    parser.add_argument("--max_speakers", type=int, default=6, help="Max speakers to separate") 
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--log_dir", type=str, default="runs", help="TensorBoard log directory")
+    parser.add_argument("--accum_steps", type=int, default=4, help="Gradient accumulation steps")
     return parser.parse_args()
 
 class LogMelSpectrogram(nn.Module):
     def __init__(self, sample_rate=16000, n_mels=128, n_fft=1024, hop_length=160, win_length=400):
-        """
-        Log Mel Spectrogram Extractor
-        Default settings aim for 10ms hop size (160 samples @ 16kHz)
-        """
         super().__init__()
         self.mel_spec = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,
@@ -52,17 +48,12 @@ class LogMelSpectrogram(nn.Module):
         self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB()
 
     def forward(self, waveform):
-        # waveform: (Batch, Samples)
-        # return: (Batch, Time, n_mels)
         mel = self.mel_spec(waveform)
         log_mel = self.amplitude_to_db(mel)
         return log_mel.transpose(1, 2)
 
 def train(args):
-    # TensorBoard Writer
-    from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(log_dir=args.log_dir)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running training on: {device}")
     
@@ -70,17 +61,12 @@ def train(args):
 
     # 1. Dataset & DataLoader
     print(f"Initializing DataLoader from repo: {args.repo_id}")
-    try:
-        dataloader = get_dataloader(
-            repo_id=args.repo_id, 
-            batch_size=args.batch_size
-        )
-    except Exception as e:
-        print(f"\n[Error] Failed to load dataset from '{args.repo_id}'.")
-        print(f"Please specify a valid Hugging Face dataset ID via --repo_id argument or edit train.py.\nDetail: {e}")
-        return
+    dataloader = get_dataloader(
+        repo_id=args.repo_id, 
+        batch_size=args.batch_size
+    )
 
-    # 2. Model & Preprocessing
+    # 2. Model & Components
     feature_extractor = LogMelSpectrogram(n_mels=args.feat_dim).to(device)
     
     model = IterativeDiarizer(
@@ -89,29 +75,24 @@ def train(args):
         max_speakers=args.max_speakers
     ).to(device)
     
-    loss_fn = SortedBCELoss().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    loss_fn = HungarianPITLoss().to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
 
-    print(f"Model initialized: {sum(p.numel() for p in model.parameters()):,} parameters")
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    )
+
+    print(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # --- Resume Logic ---
+    # Resume Logic
     start_epoch = 0
-    if args.resume_from:
-        if os.path.isfile(args.resume_from):
-            print(f"Loading checkpoint from '{args.resume_from}'")
-            checkpoint = torch.load(args.resume_from, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-            # [중요] 체크포인트의 LR 대신 현재 설정한 LR을 강제 적용
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = args.lr
-            print(f"Optimizer LR updated to: {args.lr}")
-            
-            start_epoch = checkpoint['epoch'] + 1
-            print(f"Resumed from epoch {start_epoch}")
-        else:
-            print(f"Warning: Checkpoint not found at '{args.resume_from}'. Starting from scratch.")
+    if args.resume_from and os.path.isfile(args.resume_from):
+        print(f"Loading checkpoint from '{args.resume_from}'")
+        checkpoint = torch.load(args.resume_from, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resumed from epoch {start_epoch}")
 
     # 3. Training Loop
     model.train()
@@ -122,84 +103,80 @@ def train(args):
             total_loss = 0.0
             batch_count = 0
             
-            # NOTE: NCGMStreamingDataset is iterable, so we iterate until it yields all shards or we break
+            optimizer.zero_grad() 
+            
+            # Streaming Dataset이라 len()이 없어 total을 모름 -> tqdm에 total 제거
             progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
             
-            for batch in progress_bar:
-                audio = batch['audio'].to(device)       # (B, Samples)
-                targets = batch['target_mask'].to(device) # (B, Time, Spk)
+            for i, batch in enumerate(progress_bar):
+                audio = batch['audio'].to(device)
+                targets = batch['target_mask'].to(device)
                 
-                # Feature Extraction
                 with torch.no_grad():
-                    features = feature_extractor(audio) # (B, F_Time, D)
+                    features = feature_extractor(audio)
+                    min_len = min(features.shape[1], targets.shape[1])
+                    features = features[:, :min_len, :]
+                    targets = targets[:, :min_len, :]
                 
-                # Align Time Dimension
-                # MelSpectrogram time steps might slightly differ from target_mask (2001)
-                # We crop to the minimum length to math
-                min_len = min(features.shape[1], targets.shape[1])
-                features = features[:, :min_len, :]
-                targets = targets[:, :min_len, :]
+                predictions = model(features)
                 
-                # Forward Pass
-                # IterativeDiarizer recursively finds speakers
-                predictions = model(features) # (B, Time, Max_Speakers)
-                
-                # Align Output if needed (DirectMaskDecoder preserves time usually)
                 if predictions.shape[1] != targets.shape[1]:
                     min_len_out = min(predictions.shape[1], targets.shape[1])
                     predictions = predictions[:, :min_len_out, :]
                     targets = targets[:, :min_len_out, :]
 
-                # Compute Loss
                 loss = loss_fn(predictions, targets)
                 
-                # Backward
-                optimizer.zero_grad()
+                # Gradient Accumulation
+                loss = loss / args.accum_steps
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                optimizer.step()
                 
-                total_loss += loss.item()
-                batch_count += 1
-                global_step += 1
+                total_loss += loss.item() * args.accum_steps
                 
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+                if (i + 1) % args.accum_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                    
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    
+                    # [수정됨] 스케줄러 스텝을 여기서 제거함 (에포크 단위로 이동)
+                    
+                    global_step += 1
+                    
+                    if global_step % 10 == 0:
+                        writer.add_scalar("Loss/train_step", loss.item() * args.accum_steps, global_step)
+                        writer.add_scalar("LR", optimizer.param_groups[0]['lr'], global_step)
                 
-                # TensorBoard Logging (Batch Level)
-                if global_step % 10 == 0:
-                    writer.add_scalar("Loss/train_step", loss.item(), global_step)
+                progress_bar.set_postfix({"loss": f"{loss.item() * args.accum_steps:.4f}"})
+                batch_count = i + 1 # 현재까지 처리한 배치 수 업데이트
 
             # End of Epoch
-            if batch_count > 0:
-                avg_loss = total_loss / batch_count
-                print(f"Epoch {epoch+1} Complete. Average Loss: {avg_loss:.4f}")
-                
-                # TensorBoard Logging (Epoch Level)
-                writer.add_scalar("Loss/train_epoch", avg_loss, epoch + 1)
+            # [수정됨] 스케줄러 업데이트를 에포크가 끝난 후 여기서 수행
+            scheduler.step()
+            
+            if batch_count == 0: batch_count = 1
+            avg_loss = total_loss / batch_count 
+            
+            print(f"Epoch {epoch+1} Complete. Avg Loss: {avg_loss:.4f}")
+            writer.add_scalar("Loss/train_epoch", avg_loss, epoch + 1)
 
-                # Save Checkpoint
-                ckpt_path = os.path.join(args.checkpoint_dir, f"model_epoch_{epoch+1}.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': avg_loss,
-                }, ckpt_path)
-                print(f"Checkpoint saved to {ckpt_path}")
-            else:
-                print("Warning: No batches processed. Check dataset configuration.")
-    
+            ckpt_path = os.path.join(args.checkpoint_dir, f"model_epoch_{epoch+1}.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+            }, ckpt_path)
+            
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving emergency checkpoint...")
+        print("Training interrupted. Saving checkpoint...")
         ckpt_path = os.path.join(args.checkpoint_dir, "model_interrupted.pt")
         torch.save({
-            'epoch': epoch, # Save current epoch
+            'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'loss': total_loss / max(1, batch_count),
+            'loss': avg_loss if 'avg_loss' in locals() else 0.0,
         }, ckpt_path)
-        print(f"Emergency checkpoint saved to {ckpt_path}")
-        writer.close()
         
     writer.close()
 

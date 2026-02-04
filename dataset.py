@@ -123,4 +123,5 @@ def get_dataloader(repo_id, batch_size=8, mask_prob=0.5, skip_count=0, num_worke
         skip_count=skip_count
     )
     
-    return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    # [Modified] pin_memory=True can cause core dumps on some systems/WSL at the end of epochs
+    return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=False)

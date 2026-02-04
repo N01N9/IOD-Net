@@ -1,264 +1,283 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment  # [추가] 헝가리안 알고리즘
 
 # ==========================================
-# 1. 유사 화자 분리 핵심 모듈 (Orthogonal Projection)
+# 1. Conv-TasNet 스타일의 TCN 블록 (유지)
 # ==========================================
-class SoftOrthogonalProjector(nn.Module):
+class TemporalBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, dilation, padding, dropout=0.2):
+        super(TemporalBlock, self).__init__()
+        self.conv1x1 = nn.Conv1d(in_channels, out_channels, 1)
+        self.prelu1 = nn.PReLU()
+        self.norm1 = nn.GroupNorm(1, out_channels)
+        
+        self.d_conv = nn.Conv1d(
+            out_channels, out_channels, kernel_size, 
+            stride=stride, padding=padding, dilation=dilation, 
+            groups=out_channels, bias=True
+        )
+        self.prelu2 = nn.PReLU()
+        self.norm2 = nn.GroupNorm(1, out_channels)
+        
+        self.res_out = nn.Conv1d(out_channels, in_channels, 1)
+        self.skip_out = nn.Conv1d(out_channels, in_channels, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        out = self.norm1(self.prelu1(self.conv1x1(x)))
+        out = self.norm2(self.prelu2(self.d_conv(out)))
+        out = self.dropout(out)
+        res = self.res_out(out)
+        skip = self.skip_out(out)
+        return residual + res, skip
+
+class TCNReconstructor(nn.Module):
     """
-    [핵심] 찾아낸 화자(Prob)의 벡터 방향을 계산하고, 
-    원본 특징에서 그 성분을 수학적으로 제거(Subtract)하여 
-    유사 화자(Similar Speaker)의 미세한 특징만 남기는 모듈.
+    [이전 수정 유지] input_dim과 output_dim을 분리하여 차원 충돌 해결
     """
-    def __init__(self, alpha=0.9):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, kernel_size=3, num_blocks=4):
         super().__init__()
-        self.alpha = alpha  # 제거 강도 (1.0에 가까울수록 강력하게 제거)
+        self.input_conv = nn.Conv1d(input_dim, hidden_dim, 1)
+        self.blocks = nn.ModuleList()
+        for i in range(num_blocks):
+            dilation = 2 ** i
+            padding = (kernel_size - 1) * dilation // 2
+            self.blocks.append(
+                TemporalBlock(hidden_dim, hidden_dim, kernel_size, stride=1, 
+                              dilation=dilation, padding=padding)
+            )
+        self.output_conv = nn.Sequential(
+            nn.PReLU(),
+            nn.Conv1d(hidden_dim, output_dim, 1), # 출력 차원 맞춤
+            nn.Sigmoid() 
+        )
 
-    def forward(self, features, probs):
-        # features: (Batch, Time, Dim)
-        # probs: (Batch, Time, 1) -> 현재 찾은 화자의 확률맵
-        
-        # 1. 화자 대표 벡터(Centroid) 추출
-        # 확률(probs)을 가중치로 사용하여 해당 화자가 활성화된 구간의 특징만 평균냅니다.
-        denom = probs.sum(dim=1, keepdim=True) + 1e-6
-        speaker_vector = (features * probs).sum(dim=1, keepdim=True) / denom # (B, 1, Dim)
-        
-        # 2. 벡터 정규화 (크기는 버리고 방향만 남김)
-        speaker_vector = F.normalize(speaker_vector, p=2, dim=2)
-        
-        # 3. 투영(Projection) 계산
-        # 현재 특징들(features)이 화자 벡터와 얼마나 닮았는지(내적) 계산
-        dot_product = torch.matmul(features, speaker_vector.transpose(1, 2)) # (B, T, 1)
-        
-        # 투영된 성분 (즉, 화자 A라고 판단되는 성분 벡터)
-        projection = dot_product * speaker_vector # (B, T, Dim)
-        
-        # 4. 잔차(Residual) 계산 (Soft Subtraction)
-        # alpha * probs: 화자 A가 확실한 구간에서만 강하게 지웁니다.
-        # 오버랩 구간 보존을 위해 Soft하게 뺍니다.
-        suppression = probs * self.alpha
-        residual_features = features - (projection * suppression)
-        
-        return residual_features
+    def forward(self, x):
+        x = self.input_conv(x)
+        skip_connection = 0
+        for block in self.blocks:
+            x, skip = block(x)
+            skip_connection = skip_connection + skip
+        return self.output_conv(skip_connection)
 
 # ==========================================
-# 2. 디코더 (Direct Mask Prediction)
+# 2. TCN 기반 신호 제거기 (유지)
 # ==========================================
-class DirectMaskDecoder(nn.Module):
-    """
-    Attractor나 임베딩 없이, 오디오 특징과 마스크 힌트만 보고 
-    다음 화자를 바로 색칠(Segmentation)하는 U-Net 스타일 네트워크.
-    """
+class LinearReconstructionEraser(nn.Module):
     def __init__(self, input_dim, hidden_dim=256):
         super().__init__()
-        # 입력: 오디오 특징(D) + 이전 마스크(1)
-        self.input_proj = nn.Linear(input_dim + 1, hidden_dim)
+        self.epsilon = 1e-6
         
-        # 1D CNN (문맥 파악 + 국소 경계면 탐지)
+        # [이전 수정 유지] 입출력 차원 분리 전달
+        self.reconstructor = TCNReconstructor(
+            input_dim=input_dim + 1,   # 입력: Feature(128) + Mask(1) = 129
+            output_dim=input_dim,      # 출력: Mask for Feature(128) = 128
+            hidden_dim=hidden_dim, 
+            num_blocks=4 
+        )
+
+    def forward(self, features, probs):
+        linear_features = torch.exp(features)
+        x_in = torch.cat([linear_features, probs], dim=2) 
+        x_in = x_in.transpose(1, 2) 
+        
+        ratio_mask = self.reconstructor(x_in)
+        ratio_mask = ratio_mask.transpose(1, 2) # (B, T, 128)
+        
+        estimated_signal = linear_features * ratio_mask * probs
+        linear_residual = linear_features - estimated_signal
+        
+        linear_residual = torch.relu(linear_residual) + self.epsilon
+        return torch.log(linear_residual)
+
+# ==========================================
+# 3. 디코더 (Direct Mask Prediction) - 유지
+# ==========================================
+class DirectMaskDecoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim=256):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim + 1, hidden_dim)
         self.net = nn.Sequential(
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=7, padding=3), # 넓은 문맥
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=7, padding=3),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Conv1d(hidden_dim, 1, kernel_size=1) # 최종 출력: 1채널 확률값
+            nn.Conv1d(hidden_dim, 1, kernel_size=1)
         )
 
     def forward(self, features, prev_mask):
-        # features: (B, T, D)
-        # prev_mask: (B, T, 1) -> "이 부분은 이미 찾았으니 무시해"라는 힌트
-        
-        # 1. 정보 결합 (Concatenation)
         x = torch.cat([features, prev_mask], dim=2)
-        x = self.input_proj(x) # (B, T, Hidden)
-        
-        # 2. CNN 처리를 위해 차원 변경 (B, Hidden, T)
+        x = self.input_proj(x)
         x = x.transpose(1, 2)
-        
-        # 3. 마스크 예측
         logits = self.net(x)
-        
-        # 4. 차원 복구
-        logits = logits.transpose(1, 2) # (B, T, 1)
-        
+        logits = logits.transpose(1, 2)
         return torch.sigmoid(logits)
 
 # ==========================================
-# 3. 인코더 (Placeholder)
+# 4. 인코더 (6-layer E-Branchformer) - 유지
 # ==========================================
-class EncoderPlaceholder(nn.Module):
-    """
-    실전에서는 ESPnet 등의 'EBranchformerEncoder'를 사용해야 합니다.
-    여기서는 코드 실행을 위해 Transformer로 모사했습니다.
-    """
-    def __init__(self, input_dim, output_dim=256):
+class EBranchformerLayer(nn.Module):
+    def __init__(self, d_model, nhead, d_ffn, dropout=0.1):
         super().__init__()
-        self.proj = nn.Linear(input_dim, output_dim)
-        layer = nn.TransformerEncoderLayer(d_model=output_dim, nhead=4, dim_feedforward=1024, batch_first=True)
-        self.encoder = nn.TransformerEncoder(layer, num_layers=4)
+        self.attn_norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        
+        self.cgmlp_norm = nn.LayerNorm(d_model)
+        # [이전 수정 유지] Linear -> Conv1d 교체 완료됨
+        self.cgmlp = nn.Sequential(
+            nn.Conv1d(d_model, d_ffn, kernel_size=1), 
+            nn.GELU(),
+            nn.Conv1d(d_ffn, d_ffn, kernel_size=31, stride=1, padding=15, groups=d_ffn),
+            nn.GELU(),
+            nn.Conv1d(d_ffn, d_model, kernel_size=1),
+            nn.Dropout(dropout)
+        )
+        self.merge_proj = nn.Linear(d_model * 2, d_model)
+        self.final_norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        x_norm = self.attn_norm(x)
+        x_attn, _ = self.attn(x_norm, x_norm, x_norm)
+        
+        x_local = self.cgmlp_norm(x)
+        x_local = x_local.transpose(1, 2)
+        x_local = self.cgmlp(x_local)
+        x_local = x_local.transpose(1, 2)
+        
+        concat_feat = torch.cat([x_attn, x_local], dim=-1)
+        merged = self.merge_proj(concat_feat)
+        return self.final_norm(residual + self.dropout(merged))
+
+class EBranchformerEncoder(nn.Module):
+    def __init__(self, input_dim, output_dim=256, num_layers=6):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, output_dim)
+        self.layers = nn.ModuleList([
+            EBranchformerLayer(d_model=output_dim, nhead=4, d_ffn=1024)
+            for _ in range(num_layers)
+        ])
         
     def forward(self, x):
-        x = self.proj(x)
-        return self.encoder(x)
+        x = self.input_proj(x)
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 # ==========================================
-# 4. 전체 모델 (Main Model)
+# 5. 전체 모델 (Iterative Diarizer)
 # ==========================================
 class IterativeDiarizer(nn.Module):
-    def __init__(self, input_feat_dim=128, d_model=128, max_speakers=3):
+    def __init__(self, input_feat_dim=128, d_model=128, max_speakers=6):
         super().__init__()
-        
-        # [The Ear] 고해상도 특징 추출
-        self.encoder = EncoderPlaceholder(input_feat_dim, d_model)
-        
-        # [The Brain] 화자 분리기
+        self.encoder = EBranchformerEncoder(input_feat_dim, d_model, num_layers=6)
         self.decoder = DirectMaskDecoder(d_model, hidden_dim=d_model)
-        
-        # [The Eraser] 유사 화자 제거기
-        self.projector = SoftOrthogonalProjector(alpha=0.9)
-        
+        self.projector = LinearReconstructionEraser(input_dim=d_model, hidden_dim=d_model)
         self.max_speakers = max_speakers
 
     def forward(self, audio_features, vad_mask=None):
-        """
-        Args:
-            audio_features: (Batch, Time, Feat_Dim)
-            vad_mask: (Batch, Time, 1) - 묵음=1, 소리=0 (없으면 자동 처리)
-        """
         batch_size, time, _ = audio_features.shape
-        
-        # 1. 인코딩 (한 번만 수행)
         encoded_features = self.encoder(audio_features)
         
-        # 2. 초기 마스크 설정 (VAD가 없으면 0으로 시작)
         if vad_mask is None:
             current_mask = torch.zeros(batch_size, time, 1).to(audio_features.device)
         else:
             current_mask = vad_mask
             
-        # 잔차 특징 초기화 (처음엔 원본 그대로)
         residual_features = encoded_features.clone()
-        
         all_speaker_probs = []
 
-        # 3. 반복 루프 (Recursive Loop)
         for i in range(self.max_speakers):
-            
-            # A. 디코더: 현재 잔차 특징과 마스크를 보고 다음 화자 찾기
-            # Loop 1: 가장 지배적인 화자(A) 찾기
-            # Loop 2: A가 제거된 특징에서 다음 화자(B) 찾기 ...
             speaker_prob = self.decoder(residual_features, current_mask)
             all_speaker_probs.append(speaker_prob)
-            
-            # B. 직교 투영: 방금 찾은 화자 성분을 수학적으로 제거
-            # (유사 화자 구별을 위해 방향성을 이용해 찢어냄)
             residual_features = self.projector(encoded_features, speaker_prob)
-            
-            # C. 마스크 업데이트: 찾은 화자도 "처리됨"으로 마킹
-            # max()를 써서 기존 마스크를 유지하며 누적
             current_mask = torch.max(current_mask, speaker_prob)
             
-        # 결과 결합: (Batch, Time, Max_Speakers) -> 채널 0이 첫 화자, 채널 1이 두 번째 화자...
         return torch.cat(all_speaker_probs, dim=2)
 
 # ==========================================
-# 5. Loss 함수 (Sortformer Style)
+# 6. [NEW] 헝가리안 알고리즘 기반 PIT Loss
 # ==========================================
-class SortedBCELoss(nn.Module):
+class HungarianPITLoss(nn.Module):
     """
-    PIT(순열 계산) 대신, 정답지(Target)를 '발화 시작 시간' 순서로 정렬하여
-    모델의 순차적 출력과 1:1 매칭시키는 Loss 함수.
+    Max Speaker가 많을 때(예: 6명 이상) 순열(Factorial) 대신
+    헝가리안 알고리즘(O(n^3))을 사용하여 최적의 화자 매칭을 수행하는 Loss.
     """
     def __init__(self):
         super().__init__()
         self.criterion = nn.BCELoss(reduction='none')
 
-    def sort_targets(self, targets):
-        batch_size, time, max_speakers = targets.shape
-        sorted_targets = torch.zeros_like(targets)
-        
-        for b in range(batch_size):
-            sample = targets[b].transpose(0, 1) # (Spk, Time)
-            
-            # 각 화자별 발화 시작 시간(Onset) 찾기
-            onsets = torch.argmax(sample.float(), dim=1)
-            activities = sample.sum(dim=1)
-            
-            # 말하지 않은 화자(Ghost)는 맨 뒤로 보내기
-            onsets[activities == 0] = time + 999999 
-            
-            # 시작 시간 순으로 정렬 인덱스 생성
-            sort_idx = torch.argsort(onsets)
-            
-            # 정답지 재배열
-            sorted_targets[b] = targets[b, :, sort_idx]
-            
-        return sorted_targets
-
     def forward(self, predictions, targets):
-        # 1. 정답지 정렬 (먼저 말한 사람이 채널 0으로 오도록)
-        aligned_targets = self.sort_targets(targets)
+        """
+        predictions: (Batch, Time, Spk)
+        targets: (Batch, Time, Spk)
+        """
+        b, t, s = predictions.shape
         
-        # 2. 채널 수 맞추기 (학습 시 보통 맞춰짐)
-        if predictions.shape[2] != aligned_targets.shape[2]:
-            min_ch = min(predictions.shape[2], aligned_targets.shape[2])
-            predictions = predictions[:, :, :min_ch]
-            aligned_targets = aligned_targets[:, :, :min_ch]
-
-        # 3. Loss 계산 (1:1 매칭)
-        loss = self.criterion(predictions, aligned_targets)
-        return loss.mean()
+        # 1. 모든 쌍에 대한 비용 행렬(Cost Matrix) 계산
+        # Broadcasting을 위해 차원 확장
+        # Pred: (B, T, S, 1), Target: (B, T, 1, S)
+        # 결과: (B, T, S, S) -> 각 (Pred_i, Target_j) 조합의 Loss
+        p_exp = predictions.unsqueeze(3)
+        t_exp = targets.unsqueeze(2)
+        
+        # 전체 Loss 맵 계산 (Gradient Flow 유지를 위해 여기서 수행)
+        # pairwise_loss: (B, S, S) -> Time 축 평균
+        pairwise_loss = F.binary_cross_entropy(
+            p_exp.expand(-1, -1, -1, s), 
+            t_exp.expand(-1, -1, s, -1), 
+            reduction='none'
+        ).mean(dim=1)
+        
+        total_loss = 0.0
+        
+        # 2. 배치별로 헝가리안 매칭 수행
+        # 매칭 과정(Indices 찾기)은 Gradient가 필요 없으므로 detach().numpy()
+        cost_matrices = pairwise_loss.detach().cpu().numpy()
+        
+        for i in range(b):
+            cost_mat = cost_matrices[i] # (S, S)
+            
+            # Scipy로 최적의 할당 인덱스 찾기 (row=pred_idx, col=target_idx)
+            row_idx, col_idx = linear_sum_assignment(cost_mat)
+            
+            # 3. 찾은 인덱스로 실제 Loss 값 추출 및 합산
+            # pairwise_loss[i][row, col] 값들만 골라서 평균냄
+            total_loss += pairwise_loss[i, row_idx, col_idx].mean()
+            
+        return total_loss / b
 
 # ==========================================
-# 6. 실행 및 검증 (Training Step Simulation)
+# 실행부 (Main)
 # ==========================================
 if __name__ == "__main__":
     # 설정
     BATCH_SIZE = 4
-    TIME_STEPS = 2000  # 20 seconds audio (assuming 10ms hop size)
+    TIME_STEPS = 2000
     FEAT_DIM = 128
-    MAX_SPEAKERS = 4
+    MAX_SPEAKERS = 6  # 6명 설정
     
-    # 모델 및 손실함수 생성
     model = IterativeDiarizer(FEAT_DIM, d_model=128, max_speakers=MAX_SPEAKERS)
-    loss_fn = SortedBCELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
-    print(">>> 모델 초기화 완료")
+    # [변경] HungarianPITLoss 사용
+    loss_fn = HungarianPITLoss()
+    
+    print(f">>> 모델 초기화 완료 (Max Speakers: {MAX_SPEAKERS})")
+    print(">>> 적용된 모듈: 6-Layer E-Branchformer, TCN Eraser, Hungarian PIT Loss")
 
-    # 1. 더미 데이터 생성 (입력)
     inputs = torch.randn(BATCH_SIZE, TIME_STEPS, FEAT_DIM)
-    
-    # 2. 더미 정답지 생성 (랜덤하지만 순서가 뒤섞여 있다고 가정)
-    # 실제로는 (Batch, Time, Real_Speakers) 형태
     targets = torch.randint(0, 2, (BATCH_SIZE, TIME_STEPS, MAX_SPEAKERS)).float()
     
-    # --- 학습 단계 시뮬레이션 ---
-    optimizer.zero_grad()
-    
-    # A. 순방향 전파 (Forward)
-    # 모델은 순차적으로 화자를 찾아 (Batch, Time, 3)을 출력합니다.
-    # Loop 1 -> 제일 먼저 말한 사람 (채널 0)
-    # Loop 2 -> 그다음 사람 (채널 1) ...
+    # Forward
     predictions = model(inputs)
-    
     print(f"Prediction Shape: {predictions.shape}")
     
-    # B. 손실 계산 (Loss)
-    # 내부적으로 targets를 정렬하여 predictions 순서에 맞춥니다.
+    # Loss Calc
     loss = loss_fn(predictions, targets)
-    
-    print(f"Calculated Loss: {loss.item():.4f}")
-    
-    # C. 역전파 (Backward)
-    loss.backward()
-    optimizer.step()
-    
-    print(">>> 역전파 및 가중치 업데이트 성공!")
-    print("\n[검증 포인트]")
-    print("1. Encoder는 오디오 특징을 추출함")
-    print("2. Decoder는 반복적으로 다음 화자를 찾음")
-    print("3. Projector는 찾은 화자를 수학적으로 제거(유사 화자 분리)")
-    print("4. SortedLoss는 정답지의 순서를 모델 출력 순서에 맞춰줌")
+    print(f"Hungarian PIT Loss: {loss.item():.4f}")
